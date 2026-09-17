@@ -6,6 +6,27 @@
     fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); goto done; \
 } } while (0)
 
+static int check_glm_generic_routed_moe_types(void) {
+    int rc = 1;
+    ds4_tensor iq2 = {.type = DS4_TENSOR_IQ2_XXS};
+    ds4_tensor q2 = {.type = DS4_TENSOR_Q2_K};
+    ds4_tensor q4 = {.type = DS4_TENSOR_Q4_K};
+    ds4_layer_weights layer = {
+        .ffn_gate_exps = &iq2,
+        .ffn_up_exps = &iq2,
+        .ffn_down_exps = &q2,
+    };
+    CHECK(glm_graph_layer_uses_generic_routed_moe(&layer));
+    layer.ffn_gate_exps = layer.ffn_up_exps = layer.ffn_down_exps = &q4;
+    CHECK(glm_graph_layer_uses_generic_routed_moe(&layer));
+    layer.ffn_gate_exps = NULL;
+    CHECK(!glm_graph_layer_uses_generic_routed_moe(&layer));
+    puts("GLM generic routed-MoE admits IQ2/Q2 and uniform Q4_K: PASS");
+    rc = 0;
+done:
+    return rc;
+}
+
 static int check_dispatch(void) {
     int rc = 1;
     g_ds4_shape = DS4_SHAPE_FLASH41;
@@ -394,7 +415,10 @@ done:
 }
 
 int main(int argc, char **argv) {
-    if (argc == 2 && !strcmp(argv[1], "--dispatch")) return check_dispatch();
+    if (argc == 2 && !strcmp(argv[1], "--dispatch")) {
+        if (check_glm_generic_routed_moe_types() != 0) return 1;
+        return check_dispatch();
+    }
     if (argc == 3) return check_mixed(argv[1], argv[2], NULL, false, PREFILL_METAL);
     if (argc == 4 && !strcmp(argv[1], "--resident"))
         return check_mixed(argv[2], argv[3], NULL, true, PREFILL_METAL);

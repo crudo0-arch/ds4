@@ -46079,7 +46079,8 @@ static bool glm_graph_layer_uses_generic_routed_moe(
            l->ffn_gate_exps &&
            l->ffn_up_exps &&
            l->ffn_down_exps &&
-           l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS;
+           (l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS ||
+            l->ffn_gate_exps->type == DS4_TENSOR_Q4_K);
 }
 
 static bool glm_tp_validate_ownership_kernels(
