@@ -444,11 +444,13 @@ static bool ds4_backend_supports_ssd_streaming(ds4_backend backend) {
 
 static bool ds4_backend_supports_streaming_auto_cache(ds4_backend backend) {
     if (backend == DS4_BACKEND_METAL) return true;
-#ifdef DS4_ROCM_BUILD
-    if (backend == DS4_BACKEND_CUDA) return true;
+    if (backend == DS4_BACKEND_CUDA) {
+#if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))
+        return true;
 #else
-    (void)backend;
+        return false;
 #endif
+    }
     return false;
 }
 

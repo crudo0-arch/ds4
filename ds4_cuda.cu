@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -102,9 +103,22 @@ static int g_model_hmm_direct;
 static int g_model_fd = -1;
 static const void *g_model_fd_host_base;
 static int g_model_direct_fd = -1;
+static char *g_model_pinned_mirror;
+static uint64_t g_model_pinned_mirror_size;
+static dev_t g_model_pinned_dev;
+static ino_t g_model_pinned_ino;
 static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
 static int g_model_cache_full;
+
+static bool cuda_env_enabled(const char *name) {
+    const char *value = getenv(name);
+    return value && value[0] && strcmp(value, "0") != 0 &&
+           strcasecmp(value, "false") != 0 &&
+           strcasecmp(value, "no") != 0 &&
+           strcasecmp(value, "off") != 0;
+}
+
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 static int g_cublas_ready;
@@ -181,6 +195,8 @@ static std::unordered_map<uint64_t, uint32_t> g_stream_expert_by_gate;
 /* Zero is empty; one is an unread look-ahead entry, older than any demand hit. */
 static uint64_t g_stream_expert_clock = 1;
 static std::vector<int32_t> g_stream_prefill_ids, g_stream_prefill_slots;
+static uint64_t g_stream_telemetry_decode_token;
+static uint32_t g_stream_telemetry_prev_layer = UINT32_MAX;
 extern "C" void ds4_gpu_stream_expert_cache_prefetch_finish(bool cancel);
 static void cuda_stream_prefetch_before_load(const ds4_gpu_stream_expert_table *table);
 static bool cuda_stream_prefetch_protects(const cuda_stream_expert_slot &slot);
@@ -2188,7 +2204,8 @@ static int cuda_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
 
 static int cuda_model_stage_read_from(int fd, int *direct_fd, uint64_t align,
                                      uint64_t file_size, void *stage, uint64_t stage_bytes,
-                                     uint64_t offset, uint64_t bytes, const char **payload) {
+                                     uint64_t offset, uint64_t bytes, const char **payload,
+                                     uint64_t *ssd_bytes) {
     *payload = (const char *)stage;
 #if defined(__linux__) && defined(O_DIRECT)
     if (*direct_fd >= 0 && align > 1 && file_size != 0) {
@@ -2202,6 +2219,7 @@ static int cuda_model_stage_read_from(int fd, int *direct_fd, uint64_t align,
             errno = 0;
             if (cuda_pread_full(*direct_fd, stage, read_size, aligned_off)) {
                 *payload = (const char *)stage + delta;
+                if (ssd_bytes) *ssd_bytes += read_size;
                 errno = saved_errno;
                 return 1;
             }
@@ -2220,14 +2238,17 @@ static int cuda_model_stage_read_from(int fd, int *direct_fd, uint64_t align,
     (void)stage_bytes;
     (void)direct_fd; (void)align; (void)file_size;
 #endif
-    return cuda_pread_full(fd, stage, bytes, offset);
+    if (!cuda_pread_full(fd, stage, bytes, offset)) return 0;
+    if (ssd_bytes) *ssd_bytes += bytes;
+    return 1;
 }
 
 static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
                                  uint64_t offset, uint64_t bytes,
-                                 const char **payload) {
+                                 const char **payload, uint64_t *ssd_bytes) {
     return cuda_model_stage_read_from(g_model_fd, &g_model_direct_fd,
-        g_model_direct_align, g_model_file_size, stage, stage_bytes, offset, bytes, payload);
+        g_model_direct_align, g_model_file_size, stage, stage_bytes, offset, bytes,
+        payload, ssd_bytes);
 }
 
 static void cuda_stream_selected_stage_release(void) {
@@ -2295,19 +2316,38 @@ static int cuda_model_copy_to_device_streamed(
         uint64_t offset,
         uint64_t bytes,
         const char *what,
-        uint64_t &chunk_idx) {
+        uint64_t &chunk_idx,
+        uint64_t &ssd_bytes,
+        uint64_t &h2d_bytes) {
     if (!dst || !model_map || offset > model_size ||
         bytes > model_size - offset) {
         return 0;
     }
     if (bytes == 0) return 1;
+    if (g_model_pinned_mirror && model_map == g_model_fd_host_base &&
+        offset <= g_model_pinned_mirror_size &&
+        bytes <= g_model_pinned_mirror_size - offset) {
+        cudaError_t err = cudaMemcpyAsync(dst, g_model_pinned_mirror + offset,
+                                          (size_t)bytes, cudaMemcpyHostToDevice,
+                                          g_stream_selected_upload_stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA pinned mirror copy failed for %s: %s\n",
+                    what ? what : "expert", cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            return 0;
+        }
+        h2d_bytes += bytes;
+        return 1;
+    }
     if (g_model_fd < 0 ||
         (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base)) {
-        return cuda_ok(cudaMemcpy(dst,
+        const int ok = cuda_ok(cudaMemcpy(dst,
                                   (const char *)model_map + offset,
                                   (size_t)bytes,
                                   cudaMemcpyHostToDevice),
                        what ? what : "stream selected expert copy");
+        if (ok) h2d_bytes += bytes;
+        return ok;
     }
 
     const uint64_t chunk = cuda_model_copy_chunk_bytes();
@@ -2333,7 +2373,7 @@ static int cuda_model_copy_to_device_streamed(
         const char *payload = NULL;
         if (!cuda_model_stage_read(g_stream_selected_stage[bi],
                                    g_stream_selected_stage_bytes,
-                                   offset + copied, n, &payload)) {
+                                   offset + copied, n, &payload, &ssd_bytes)) {
             fprintf(stderr,
                     "ds4: CUDA streaming selected read failed for %s at %.2f MiB: %s\n",
                     what ? what : "expert", (double)copied / 1048576.0,
@@ -2351,6 +2391,7 @@ static int cuda_model_copy_to_device_streamed(
             (void)cudaGetLastError();
             return 0;
         }
+        h2d_bytes += n;
         err = cudaEventRecord(g_stream_selected_stage_event[bi],
                               g_stream_selected_upload_stream);
         if (err != cudaSuccess) {
@@ -2484,7 +2525,7 @@ static const char *cuda_model_range_ptr_from_fd(
         }
         const char *payload = NULL;
         if (!cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes,
-                                   offset + copied, n, &payload)) {
+                                   offset + copied, n, &payload, NULL)) {
             fprintf(stderr, "ds4: CUDA model range read failed for %s at %.2f MiB: %s\n",
                     what ? what : "weights",
                     (double)copied / 1048576.0,
@@ -2992,6 +3033,13 @@ extern "C" void ds4_gpu_cleanup(void) {
     if (g_model_direct_fd >= 0) {
         (void)close(g_model_direct_fd);
         g_model_direct_fd = -1;
+    }
+    if (g_model_pinned_mirror) {
+        (void)cudaFreeHost(g_model_pinned_mirror);
+        g_model_pinned_mirror = NULL;
+        g_model_pinned_mirror_size = 0;
+        g_model_pinned_dev = 0;
+        g_model_pinned_ino = 0;
     }
     g_model_direct_align = 1;
     g_model_file_size = 0;
@@ -4492,12 +4540,28 @@ extern "C" int ds4_gpu_lookup_cache_strict(uint64_t source_offset,
 
 extern "C" int ds4_gpu_set_model_fd(int fd) {
     ds4_gpu_stream_expert_cache_prefetch_finish(true);
+    if (g_model_pinned_mirror && fd >= 0) {
+        struct stat same;
+        if (fstat(fd, &same) == 0 && same.st_dev == g_model_pinned_dev &&
+            same.st_ino == g_model_pinned_ino && (uint64_t)same.st_size == g_model_pinned_mirror_size) {
+            g_model_fd = fd;
+            g_model_fd_host_base = g_model_host_base;
+            return 1;
+        }
+    }
     g_model_fd = fd;
     g_model_fd_host_base = g_model_host_base;
     g_model_file_size = 0;
     if (g_model_direct_fd >= 0) {
         (void)close(g_model_direct_fd);
         g_model_direct_fd = -1;
+    }
+    if (g_model_pinned_mirror) {
+        (void)cudaFreeHost(g_model_pinned_mirror);
+        g_model_pinned_mirror = NULL;
+        g_model_pinned_mirror_size = 0;
+        g_model_pinned_dev = 0;
+        g_model_pinned_ino = 0;
     }
     g_model_direct_align = 1;
     if (fd >= 0) {
@@ -4523,6 +4587,47 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
             }
         }
 #endif
+        if (cuda_env_enabled("DS4_CUDA_PIN_MODEL_MIRROR") && g_model_file_size != 0) {
+            void *mirror = NULL;
+            fprintf(stderr, "ds4: CUDA allocating %.2f GiB pinned model mirror\n",
+                    (double)g_model_file_size / 1073741824.0);
+            cudaError_t err = cudaMallocHost(&mirror, (size_t)g_model_file_size);
+            if (err == cudaSuccess && mirror) {
+                const uint64_t chunk = UINT64_C(256) << 20;
+                uint64_t copied = 0;
+                while (copied < g_model_file_size) {
+                    const uint64_t n = std::min(chunk, g_model_file_size - copied);
+                    if (!cuda_pread_full(fd, (char *)mirror + copied, n, copied)) break;
+#if defined(POSIX_FADV_DONTNEED)
+                    (void)posix_fadvise(fd, (off_t)copied, (off_t)n, POSIX_FADV_DONTNEED);
+#endif
+                    copied += n;
+                    if ((copied % (UINT64_C(8) << 30)) < chunk || copied == g_model_file_size) {
+                        fprintf(stderr, "ds4: CUDA pinned model mirror %.2f / %.2f GiB loaded\n",
+                                (double)copied / 1073741824.0,
+                                (double)g_model_file_size / 1073741824.0);
+                    }
+                }
+                if (copied == g_model_file_size) {
+                    g_model_pinned_mirror = (char *)mirror;
+                    g_model_pinned_mirror_size = g_model_file_size;
+                    struct stat identity;
+                    if (fstat(fd, &identity) == 0) {
+                        g_model_pinned_dev = identity.st_dev;
+                        g_model_pinned_ino = identity.st_ino;
+                    }
+                    fprintf(stderr, "ds4: CUDA pinned model mirror ready\n");
+                } else {
+                    fprintf(stderr, "ds4: CUDA pinned model mirror read failed at %.2f GiB: %s\n",
+                            (double)copied / 1073741824.0, strerror(errno));
+                    (void)cudaFreeHost(mirror);
+                }
+            } else {
+                fprintf(stderr, "ds4: CUDA pinned model mirror allocation skipped: %s\n",
+                        cudaGetErrorString(err));
+                (void)cudaGetLastError();
+            }
+        }
     }
     return 1;
 }
@@ -27141,6 +27246,15 @@ static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
         uint32_t slot_count) {
+    const bool telemetry = getenv("DS4_CUDA_STREAM_TELEMETRY") != NULL;
+    const double telemetry_t0 = telemetry ? cuda_wall_sec() : 0.0;
+    const bool repeat_request =
+        telemetry && table && g_stream_selected_cache.valid &&
+        g_stream_selected_cache.layer == table->layer &&
+        g_stream_selected_cache.slot_count == slot_count &&
+        g_stream_selected_cache.gate_offset == table->gate_offset &&
+        g_stream_selected_cache.up_offset == table->up_offset &&
+        g_stream_selected_cache.down_offset == table->down_offset;
     cuda_stream_prefetch_before_load(table);
     cuda_stream_selected_cache_invalidate();
     if (!g_ssd_streaming_mode) return 1;
@@ -27228,6 +27342,9 @@ static int cuda_stream_selected_cache_begin_load(
         }
         const uint64_t stamp = ++g_stream_expert_clock;
         std::vector<int32_t> slots(unique.size(), -1);
+        std::vector<uint8_t> hit_flags;
+        if (telemetry) hit_flags.resize(unique.size());
+        uint32_t hit_count = 0;
         /* Protect every hit first: a miss must not evict a later request's hit. */
         for (size_t i = 0; i < unique.size(); i++) {
             const uint64_t expert = (uint32_t)unique[i];
@@ -27242,9 +27359,14 @@ static int cuda_stream_selected_cache_begin_load(
                 continue;
             }
             slots[i] = (int32_t)found->second;
+            if (telemetry) hit_flags[i] = 1;
+            hit_count++;
             slot.used = stamp;
         }
         cuda_stream_upload_batch uploads;
+        uint64_t ssd_bytes = 0;
+        uint64_t h2d_bytes = 0;
+        uint32_t new_experts = 0;
         for (size_t i = 0; i < unique.size(); i++) {
             if (slots[i] >= 0) continue;
             uint32_t victim = UINT32_MAX;
@@ -27266,15 +27388,19 @@ static int cuda_stream_selected_cache_begin_load(
             const uint64_t up = table->up_offset + expert * table->gate_expert_bytes;
             const uint64_t down = table->down_offset + expert * table->down_expert_bytes;
             uploads.active = true;
+            new_experts++;
             if (!cuda_model_copy_to_device_streamed(
                     cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes,
-                    table->model_map, table->model_size, gate, table->gate_expert_bytes, "stream gate", uploads.chunks) ||
+                    table->model_map, table->model_size, gate, table->gate_expert_bytes, "stream gate",
+                    uploads.chunks, ssd_bytes, h2d_bytes) ||
                 !cuda_model_copy_to_device_streamed(
                     cache.up_ptr + (uint64_t)victim * table->gate_expert_bytes,
-                    table->model_map, table->model_size, up, table->gate_expert_bytes, "stream up", uploads.chunks) ||
+                    table->model_map, table->model_size, up, table->gate_expert_bytes, "stream up",
+                    uploads.chunks, ssd_bytes, h2d_bytes) ||
                 !cuda_model_copy_to_device_streamed(
                     cache.down_ptr + (uint64_t)victim * table->down_expert_bytes,
-                    table->model_map, table->model_size, down, table->down_expert_bytes, "stream down", uploads.chunks))
+                    table->model_map, table->model_size, down, table->down_expert_bytes, "stream down",
+                    uploads.chunks, ssd_bytes, h2d_bytes))
                 return 0;
             slot = {gate, up, down, stamp};
             g_stream_expert_by_gate[gate] = victim;
@@ -27287,6 +27413,7 @@ static int cuda_stream_selected_cache_begin_load(
         if (!cuda_ok(cudaMemcpy(cache.slot_selected_ptr, remap.data(),
                 (size_t)slot_count * sizeof(int32_t), cudaMemcpyHostToDevice),
                 "stream selected-id remap copy")) return 0;
+        h2d_bytes += (uint64_t)slot_count * sizeof(int32_t);
         cache.layer = table->layer;
         cache.n_total_expert = table->n_total_expert;
         cache.slot_count = slot_count;
@@ -27299,6 +27426,38 @@ static int cuda_stream_selected_cache_begin_load(
         cache.slot_selected_tensor.owner = 0;
         cache.slot_selected_tensor.device_id = 0;
         cache.valid = 1;
+        if (telemetry) {
+            const bool decode = slot_count <= 16u;
+            if (!repeat_request) {
+                if (decode) {
+                    if (g_stream_telemetry_prev_layer == UINT32_MAX ||
+                        table->layer <= g_stream_telemetry_prev_layer) {
+                        g_stream_telemetry_decode_token++;
+                    }
+                    g_stream_telemetry_prev_layer = table->layer;
+                } else {
+                    g_stream_telemetry_prev_layer = UINT32_MAX;
+                }
+            }
+            fprintf(stderr,
+                    "ds4: CUDA stream telemetry token=%llu phase=%s layer=%u repeat=%u "
+                    "slots=%u unique=%zu hits=%u misses=%zu new=%u ssd_bytes=%llu "
+                    "h2d_bytes=%llu cache_entries=%zu cache_capacity=%zu load_ms=%.3f",
+                    (unsigned long long)(decode ? g_stream_telemetry_decode_token : 0),
+                    decode ? "decode" : "prefill", table->layer, repeat_request ? 1u : 0u,
+                    slot_count, unique.size(), hit_count, unique.size() - hit_count, new_experts,
+                    (unsigned long long)ssd_bytes, (unsigned long long)h2d_bytes,
+                    g_stream_expert_by_gate.size(), g_stream_expert_slots.size(),
+                    (cuda_wall_sec() - telemetry_t0) * 1000.0);
+            if (decode) {
+                fprintf(stderr, " experts=");
+                for (size_t i = 0; i < unique.size(); i++) {
+                    fprintf(stderr, "%s%d:%c", i ? "," : "", unique[i],
+                            hit_flags[i] ? 'H' : 'M');
+                }
+            }
+            fputc(10, stderr);
+        }
         return 1;
     } catch (...) {
         cuda_stream_selected_cache_release();
@@ -27372,7 +27531,7 @@ static void *cuda_stream_prefetch_read(void *) {
             const uint64_t bytes = std::min(chunk, copy.bytes - offset);
             const char *payload = NULL;
             p.ok = cuda_model_stage_read_from(p.fd, &p.direct_fd, p.align, p.file_size,
-                p.stage[ring], p.stage_bytes, copy.offset + offset, bytes, &payload) != 0;
+                p.stage[ring], p.stage_bytes, copy.offset + offset, bytes, &payload, nullptr) != 0;
             if (!p.ok || p.cancel.load(std::memory_order_relaxed)) { p.ok = false; break; }
             p.ok = cudaMemcpyAsync(copy.destination + offset, payload, bytes,
                 cudaMemcpyHostToDevice, p.stream) == cudaSuccess &&
@@ -33742,6 +33901,10 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
 
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_ssd_streaming_mode = enabled ? 1 : 0;
+    if (enabled) {
+        g_stream_telemetry_decode_token = 0;
+        g_stream_telemetry_prev_layer = UINT32_MAX;
+    }
     cuda_stream_selected_cache_invalidate();
     if (!g_ssd_streaming_mode) cuda_stream_selected_cache_release();
 }
