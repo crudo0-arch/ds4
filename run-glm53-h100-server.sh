@@ -4,7 +4,7 @@ repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 model="${DS4_GLM_MODEL:-/models/ds4-models/GLM-5.3-Flash-Q4_K.gguf}"
 cache_target="${DS4_GLM_CACHE_TARGET:-62GB}"
 guard_reserve_gb="${DS4_GLM_MEMORY_GUARD_RESERVE_GB:-1}"
-ctx="${DS4_GLM_SERVER_CTX:-65536}"
+ctx="${DS4_GLM_SERVER_CTX:-262144}"
 port="${DS4_GLM_SERVER_PORT:-8000}"
 [[ -r "$model" ]] || { printf 'Model not readable: %s\n' "$model" >&2; exit 1; }
 mkdir -p /run/ds4-kv

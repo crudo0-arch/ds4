@@ -12528,12 +12528,14 @@ static bool should_remember_thinking_checkpoint(const request *r,
                                                 const thinking_state *thinking,
                                                 const char *finish) {
     if (!r || r->kind != REQ_CHAT) return false;
-    /* Qwen Chat Completions clients may omit reasoning even with tools.
+    /* Qwen and GLM Chat Completions clients may omit reasoning even with tools.
      * Remember an alternative visible key without changing exact replay.
      * Actual tool calls have their own checkpoint path at the call site. */
-    const bool qwen_chat = r->model_syntax == SERVER_MODEL_SYNTAX_QWEN &&
-                           r->api != API_RESPONSES && r->api != API_ANTHROPIC;
-    if ((r->has_tools || r->prompt_preserves_reasoning) && !qwen_chat) return false;
+    const bool visible_chat =
+        (r->model_syntax == SERVER_MODEL_SYNTAX_QWEN ||
+         r->model_syntax == SERVER_MODEL_SYNTAX_GLM) &&
+        r->api != API_RESPONSES && r->api != API_ANTHROPIC;
+    if ((r->has_tools || r->prompt_preserves_reasoning) && !visible_chat) return false;
     if (!ds4_think_mode_enabled(r->think_mode)) return false;
     if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
     if (thinking && thinking->inside) return false;
@@ -20586,6 +20588,8 @@ static void test_thinking_checkpoint_remember_gate(void) {
     r.prompt_preserves_reasoning = false;
     r.has_tools = true;
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
     r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
     r.prompt_preserves_reasoning = true;
     TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
