@@ -7,8 +7,8 @@ guard_reserve_gb="${DS4_GLM_MEMORY_GUARD_RESERVE_GB:-1}"
 ctx="${DS4_GLM_SERVER_CTX:-65536}"
 port="${DS4_GLM_SERVER_PORT:-8000}"
 [[ -r "$model" ]] || { printf 'Model not readable: %s\n' "$model" >&2; exit 1; }
-mkdir -p /var/cache/ds4-kv
-chmod 700 /var/cache/ds4-kv
+mkdir -p /run/ds4-kv
+chmod 700 /run/ds4-kv
 cd "$repo_dir"
 exec env \
     DS4_CUDA_NO_DIRECT_IO=1 \
@@ -20,8 +20,8 @@ exec env \
         --cuda \
         --ssd-streaming \
         --ssd-streaming-cache-experts "$cache_target" \
-        --kv-disk-dir /var/cache/ds4-kv \
-        --kv-disk-space-mb 8192 \
+        --kv-disk-dir /run/ds4-kv \
+        --kv-disk-space-mb 16384 \
         --ctx "$ctx" \
         --host 0.0.0.0 \
         --port "$port"
