@@ -4,10 +4,11 @@ repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 model="${DS4_GLM_MODEL:-/models/ds4-models/GLM-5.3-Flash-Q4_K.gguf}"
 cache_target="${DS4_GLM_CACHE_TARGET:-62GB}"
 guard_reserve_gb="${DS4_GLM_MEMORY_GUARD_RESERVE_GB:-1}"
-ctx="${DS4_GLM_SERVER_CTX:-32768}"
+ctx="${DS4_GLM_SERVER_CTX:-65536}"
 port="${DS4_GLM_SERVER_PORT:-8000}"
-[[ -r "$model" ]] || { printf 'Model not readable: %s
-' "$model" >&2; exit 1; }
+[[ -r "$model" ]] || { printf 'Model not readable: %s\n' "$model" >&2; exit 1; }
+mkdir -p /var/cache/ds4-kv
+chmod 700 /var/cache/ds4-kv
 cd "$repo_dir"
 exec env \
     DS4_CUDA_NO_DIRECT_IO=1 \
@@ -19,6 +20,8 @@ exec env \
         --cuda \
         --ssd-streaming \
         --ssd-streaming-cache-experts "$cache_target" \
+        --kv-disk-dir /var/cache/ds4-kv \
+        --kv-disk-space-mb 8192 \
         --ctx "$ctx" \
-        --host 127.0.0.1 \
+        --host 0.0.0.0 \
         --port "$port"
