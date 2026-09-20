@@ -12824,7 +12824,7 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
 /* Match clients that omit reasoning, while keeping the exact sampled KV.
  * Tool decoding stops at </tool_call>, BEFORE the assistant end token. Leave
  * <|im_end|> out of the visible key so the next suffix actually evaluates it. */
-static char *build_qwen_tool_turn_visible_text(const request *r,
+static char *build_chat_tool_turn_visible_text(const request *r,
                                                const char *finish,
                                                bool inside_thinking,
                                                const char *content,
@@ -12832,32 +12832,39 @@ static char *build_qwen_tool_turn_visible_text(const request *r,
     if (!r || !calls || calls->len == 0) return NULL;
     if (r->kind != REQ_CHAT || r->image_count != 0) return NULL;
     if (r->api == API_RESPONSES || r->api == API_ANTHROPIC) return NULL;
-    if (r->model_syntax != SERVER_MODEL_SYNTAX_QWEN) return NULL;
+    if (r->model_syntax != SERVER_MODEL_SYNTAX_QWEN &&
+        r->model_syntax != SERVER_MODEL_SYNTAX_GLM) return NULL;
     if (!r->prompt_text || !r->prompt_text[0]) return NULL;
     if (!calls->raw_tool_text || !calls->raw_tool_text[0]) return NULL;
     /* Use the decode finish, not the parser's promoted tool_calls status:
      * repaired/truncated output and unclosed reasoning are not this frontier. */
     if (!finish || strcmp(finish, "tool_calls") || inside_thinking) return NULL;
-    char *suffix = build_qwen_assistant_suffix(r, content, NULL, false, calls);
+    char *suffix = r->model_syntax == SERVER_MODEL_SYNTAX_QWEN
+        ? build_qwen_assistant_suffix(r, content, NULL, false, calls)
+        : build_tool_checkpoint_suffix(r, content, NULL, calls);
     buf visible = {0};
     buf_puts(&visible, r->prompt_text);
-    buf_append(&visible, suffix, strlen(suffix) - strlen("<|im_end|>"));
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
+        buf_append(&visible, suffix, strlen(suffix) - strlen("<|im_end|>"));
+    } else {
+        buf_puts(&visible, suffix);
+    }
     free(suffix);
     return buf_take(&visible);
 }
 
-static bool remember_qwen_tool_turn_visible_checkpoint(server *s, server_slot *slot,
+static bool remember_chat_tool_turn_visible_checkpoint(server *s, server_slot *slot,
                                                        job *j, const char *ctx,
                                                        const char *finish,
                                                        bool inside_thinking,
                                                        const char *content,
                                                        const tool_calls *calls) {
-    char *visible = build_qwen_tool_turn_visible_text(&j->req, finish,
+    char *visible = build_chat_tool_turn_visible_text(&j->req, finish,
                                                      inside_thinking, content, calls);
     if (!visible) return false;
     thinking_live_remember(s, slot, visible, &j->req);
     server_log(DS4_LOG_KVCACHE,
-               "ds4-server: qwen tool-turn visible checkpoint remembered ctx=%s live=%d visible=%zu",
+               "ds4-server: chat tool-turn visible checkpoint remembered ctx=%s live=%d visible=%zu",
                ctx, ds4_session_pos(slot->session),
                strlen(visible));
     free(visible);
@@ -14438,7 +14445,7 @@ decode_again:
                                      parsed_reasoning, &parsed_calls);
         thinking_live_clear(s, slot);
     } else if (parsed_calls.len) {
-        if (!remember_qwen_tool_turn_visible_checkpoint(
+        if (!remember_chat_tool_turn_visible_checkpoint(
                 s, slot, j, ctx_span, finish, thinking.inside,
                 parsed_content ? parsed_content : "",
                 &parsed_calls))
@@ -14948,6 +14955,12 @@ static bool send_models(server *s, int fd) {
         append_model_json(&b, s, "qwen3.8-flash-next-chat");
         buf_putc(&b, ',');
         append_model_json(&b, s, "qwen3.8-flash-next-reasoner");
+    } else if (ds4_engine_is_glm53(s->engine)) {
+        append_model_json(&b, s, "glm-5.3-flash");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "glm-5.3-flash-chat");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "glm-5.3-flash-reasoner");
     } else if (ds4_engine_is_glm_dsa(s->engine)) {
         append_model_json(&b, s, "glm-5.2");
         buf_putc(&b, ',');
@@ -17620,19 +17633,19 @@ static void test_qwen_tool_visible_checkpoint_boundary(void) {
             tool_calls_push(&assistant.calls, call);
             assistant.calls.raw_tool_text = xstrdup(
                 "\n\n<tool_call>\n<function=bash>\n</function>\n</tool_call>");
-            char *visible = build_qwen_tool_turn_visible_text(
+            char *visible = build_chat_tool_turn_visible_text(
                 &r, "tool_calls", false, assistant.content, &assistant.calls);
             TEST_ASSERT(visible != NULL);
-            TEST_ASSERT(build_qwen_tool_turn_visible_text(
+            TEST_ASSERT(build_chat_tool_turn_visible_text(
                 &r, "length", false, assistant.content, &assistant.calls) == NULL);
-            TEST_ASSERT(build_qwen_tool_turn_visible_text(
+            TEST_ASSERT(build_chat_tool_turn_visible_text(
                 &r, "tool_calls", true, assistant.content, &assistant.calls) == NULL);
             r.image_count = 1;
-            TEST_ASSERT(build_qwen_tool_turn_visible_text(
+            TEST_ASSERT(build_chat_tool_turn_visible_text(
                 &r, "tool_calls", false, assistant.content, &assistant.calls) == NULL);
             r.image_count = 0;
             r.api = API_RESPONSES;
-            TEST_ASSERT(build_qwen_tool_turn_visible_text(
+            TEST_ASSERT(build_chat_tool_turn_visible_text(
                 &r, "tool_calls", false, assistant.content, &assistant.calls) == NULL);
             chat_msgs_push(&msgs, assistant);
             chat_msg tool = {0};
@@ -17660,6 +17673,51 @@ static void test_qwen_tool_visible_checkpoint_boundary(void) {
             chat_msgs_free(&msgs);
         }
     }
+}
+
+static void test_glm_tool_visible_checkpoint_boundary(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("run it");
+    chat_msgs_push(&msgs, user);
+
+    request r = {0};
+    r.kind = REQ_CHAT;
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+    r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, NULL, r.think_mode);
+
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.content = xstrdup("");
+    tool_call call = {0};
+    call.name = xstrdup("terminal");
+    call.arguments = xstrdup("{\"command\":\"true\"}");
+    tool_calls_push(&assistant.calls, call);
+    assistant.calls.raw_tool_text = xstrdup(
+        DS4_TOOL_CALLS_START "\n" DS4_INVOKE_START " name=\"terminal\">\n"
+        DS4_PARAM_START " name=\"command\">true" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END);
+
+    char *visible = build_chat_tool_turn_visible_text(
+        &r, "tool_calls", false, assistant.content, &assistant.calls);
+    TEST_ASSERT(visible != NULL);
+
+    chat_msgs_push(&msgs, assistant);
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.content = xstrdup("ok");
+    chat_msgs_push(&msgs, tool);
+    char *next = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, NULL, r.think_mode);
+    TEST_ASSERT(visible && !strncmp(next, visible, strlen(visible)));
+
+    free(next);
+    free(visible);
+    free(r.prompt_text);
+    chat_msgs_free(&msgs);
 }
 
 static void test_render_qwen_tool_round_trip(void) {
@@ -22043,6 +22101,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_qwen_chat_prompt_text();
     test_render_qwen_tool_round_trip();
     test_qwen_tool_visible_checkpoint_boundary();
+    test_glm_tool_visible_checkpoint_boundary();
     test_qwen_decode_tracker_markers();
     test_parse_qwen_tool_call_message();
     test_qwen_literal_tool_end_in_argument();
