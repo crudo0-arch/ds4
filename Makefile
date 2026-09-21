@@ -395,6 +395,19 @@ tests/test_cuda_ssd_repack: tests/test_cuda_ssd_repack.o ds4_cuda.o ds4_image.o 
 tests/test_cuda_ssd_cache: tests/test_cuda_ssd_cache.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
+tests/test_cuda_stream_cache_state.o: tests/test_cuda_stream_cache_state.c tests/cuda_stream_cache_test.h
+	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/ds4_cuda_stream_cache_test.o: ds4_cuda.cu tests/cuda_stream_cache_test.h
+	$(NVCC) $(NVCCFLAGS) -DDS4_TEST_HOOKS -c -o $@ $<
+
+tests/test_cuda_stream_cache_state: tests/test_cuda_stream_cache_state.o tests/ds4_cuda_stream_cache_test.o ds4_image.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+.PHONY: test-cuda-stream-cache-state
+test-cuda-stream-cache-state: tests/test_cuda_stream_cache_state
+	./tests/test_cuda_stream_cache_state
+
 .PHONY: test-cuda-ssd-cache
 test-cuda-ssd-cache: tests/test_cuda_ssd_cache
 	./tests/test_cuda_ssd_cache

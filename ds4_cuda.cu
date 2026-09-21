@@ -83,6 +83,9 @@ typedef struct {
 
 #include "ds4_gpu_mgpu.h"
 #include "ds4_gpu_tp.h"
+#ifdef DS4_TEST_HOOKS
+#include "tests/cuda_stream_cache_test.h"
+#endif
 #include "ds4_iq2_tables_cuda.inc"
 
 typedef struct {
@@ -160,7 +163,7 @@ extern "C" uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(uint64_t,
 
 typedef struct {
     int valid;
-    int logical_tier;
+    int logical_tier = -1;
     const void *model_map;
     uint32_t layer;
     uint32_t n_total_expert;
@@ -184,19 +187,39 @@ typedef struct {
     uint64_t prefill_capacity;
 } cuda_stream_selected_cache;
 
-static cuda_stream_selected_cache g_stream_selected_cache;
-static uint32_t g_stream_expert_budget;
-static uint64_t g_stream_expert_bytes;
 struct cuda_stream_expert_slot {
     uint64_t gate, up, down, used;
 };
-static std::vector<cuda_stream_expert_slot> g_stream_expert_slots;
-static std::unordered_map<uint64_t, uint32_t> g_stream_expert_by_gate;
-/* Zero is empty; one is an unread look-ahead entry, older than any demand hit. */
-static uint64_t g_stream_expert_clock = 1;
-static std::vector<int32_t> g_stream_prefill_ids, g_stream_prefill_slots;
-static uint64_t g_stream_telemetry_decode_token;
-static uint32_t g_stream_telemetry_prev_layer = UINT32_MAX;
+
+struct cuda_stream_expert_cache_state {
+    cuda_stream_selected_cache selected_cache = {};
+    uint32_t expert_budget = 0;
+    uint64_t expert_bytes = 0;
+    std::vector<cuda_stream_expert_slot> expert_slots;
+    std::unordered_map<uint64_t, uint32_t> expert_by_gate;
+    /* Zero is empty; one is an unread look-ahead entry, older than demand. */
+    uint64_t expert_clock = 1;
+    std::vector<int32_t> prefill_ids, prefill_slots;
+    uint64_t telemetry_decode_token = 0;
+    uint32_t telemetry_prev_layer = UINT32_MAX;
+};
+
+/* Device cache metadata is per tier; the pinned host model mirror is shared. */
+static cuda_stream_expert_cache_state g_stream_cache_states[DS4_MAX_GPUS];
+static int cuda_stream_cache_state_index(void);
+static cuda_stream_expert_cache_state &cuda_stream_cache_state_current(void) {
+    return g_stream_cache_states[cuda_stream_cache_state_index()];
+}
+#define g_stream_selected_cache (cuda_stream_cache_state_current().selected_cache)
+#define g_stream_expert_budget (cuda_stream_cache_state_current().expert_budget)
+#define g_stream_expert_bytes (cuda_stream_cache_state_current().expert_bytes)
+#define g_stream_expert_slots (cuda_stream_cache_state_current().expert_slots)
+#define g_stream_expert_by_gate (cuda_stream_cache_state_current().expert_by_gate)
+#define g_stream_expert_clock (cuda_stream_cache_state_current().expert_clock)
+#define g_stream_prefill_ids (cuda_stream_cache_state_current().prefill_ids)
+#define g_stream_prefill_slots (cuda_stream_cache_state_current().prefill_slots)
+#define g_stream_telemetry_decode_token (cuda_stream_cache_state_current().telemetry_decode_token)
+#define g_stream_telemetry_prev_layer (cuda_stream_cache_state_current().telemetry_prev_layer)
 extern "C" void ds4_gpu_stream_expert_cache_prefetch_finish(bool cancel);
 static void cuda_stream_prefetch_before_load(const ds4_gpu_stream_expert_table *table);
 static bool cuda_stream_prefetch_protects(const cuda_stream_expert_slot &slot);
@@ -210,33 +233,27 @@ static void cuda_stream_selected_cache_invalidate(void) {
 }
 
 static void cuda_stream_selected_cache_release(void) {
+    /* Keep a stable owner reference: selecting the cache's CUDA device must not
+     * redirect the current-device macros to another tier mid-release. */
+    auto &state = cuda_stream_cache_state_current();
+    auto &cache = state.selected_cache;
     ds4_gpu_stream_expert_cache_prefetch_finish(true);
-    const int tier = g_stream_selected_cache.logical_tier;
+    const int tier = cache.logical_tier;
     if (tier >= 0 && tier < g_n_gpus) {
         (void)ds4_gpu_set_current_device(tier);
     }
-    if (g_stream_selected_cache.gate_ptr) {
-        (void)cudaFree(g_stream_selected_cache.gate_ptr);
-    }
-    if (g_stream_selected_cache.up_ptr) {
-        (void)cudaFree(g_stream_selected_cache.up_ptr);
-    }
-    if (g_stream_selected_cache.down_ptr) {
-        (void)cudaFree(g_stream_selected_cache.down_ptr);
-    }
-    if (g_stream_selected_cache.slot_selected_ptr) {
-        (void)cudaFree(g_stream_selected_cache.slot_selected_ptr);
-    }
-    if (g_stream_selected_cache.prefill_ptr) {
-        (void)cudaFree(g_stream_selected_cache.prefill_ptr);
-    }
-    memset(&g_stream_selected_cache, 0, sizeof(g_stream_selected_cache));
-    g_stream_selected_cache.logical_tier = -1;
-    g_stream_expert_slots.clear();
-    g_stream_expert_by_gate.clear();
-    g_stream_expert_clock = 1;
-    g_stream_prefill_ids.clear();
-    g_stream_prefill_slots.clear();
+    if (cache.gate_ptr) (void)cudaFree(cache.gate_ptr);
+    if (cache.up_ptr) (void)cudaFree(cache.up_ptr);
+    if (cache.down_ptr) (void)cudaFree(cache.down_ptr);
+    if (cache.slot_selected_ptr) (void)cudaFree(cache.slot_selected_ptr);
+    if (cache.prefill_ptr) (void)cudaFree(cache.prefill_ptr);
+    memset(&cache, 0, sizeof(cache));
+    cache.logical_tier = -1;
+    state.expert_slots.clear();
+    state.expert_by_gate.clear();
+    state.expert_clock = 1;
+    state.prefill_ids.clear();
+    state.prefill_slots.clear();
 }
 
 typedef struct {
@@ -293,6 +310,29 @@ static_assert(DS4_MAX_GPUS == 16, "DS4_MAX_GPUS stack tables sized for 16");
 ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
 int         g_n_gpus = 0;
 int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
+#ifdef DS4_TEST_HOOKS
+static int g_cuda_stream_test_device;
+#endif
+static bool cuda_stream_current_device(int *device) {
+#ifdef DS4_TEST_HOOKS
+    *device = g_cuda_stream_test_device;
+    return true;
+#else
+    if (cudaGetDevice(device) == cudaSuccess) return true;
+    (void)cudaGetLastError();
+    return false;
+#endif
+}
+static int cuda_stream_cache_state_index(void) {
+    int device = 0;
+    if (cuda_stream_current_device(&device)) {
+        for (int tier = 0; tier < g_n_gpus; tier++) {
+            if (g_gpu[tier].device_id == device) return tier;
+        }
+    }
+    /* Before initialization, preserve the historical single-GPU state. */
+    return 0;
+}
 static bool g_device_is_spark = false;
 
 extern "C" int ds4_gpu_device_is_spark(void) {
@@ -495,11 +535,20 @@ static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
 static uint64_t g_model_stage_bytes;
-static void *g_stream_selected_stage_raw[4];
-static void *g_stream_selected_stage[4];
-static cudaEvent_t g_stream_selected_stage_event[4];
-static uint64_t g_stream_selected_stage_bytes;
-static cudaStream_t g_stream_selected_upload_stream;
+struct cuda_stream_selected_stage_state {
+    void *raw[4] = {};
+    void *stage[4] = {};
+    cudaEvent_t event[4] = {};
+    uint64_t bytes = 0;
+    cudaStream_t upload_stream = NULL;
+};
+static cuda_stream_selected_stage_state
+    g_stream_selected_stages[DS4_MAX_GPUS];
+#define g_stream_selected_stage_raw (g_stream_selected_stages[cuda_stream_cache_state_index()].raw)
+#define g_stream_selected_stage (g_stream_selected_stages[cuda_stream_cache_state_index()].stage)
+#define g_stream_selected_stage_event (g_stream_selected_stages[cuda_stream_cache_state_index()].event)
+#define g_stream_selected_stage_bytes (g_stream_selected_stages[cuda_stream_cache_state_index()].bytes)
+#define g_stream_selected_upload_stream (g_stream_selected_stages[cuda_stream_cache_state_index()].upload_stream)
 
 static int cuda_ok(cudaError_t err, const char *what);
 extern "C" void ds4_gpu_decode_graphs_invalidate(void);
@@ -2905,7 +2954,12 @@ extern "C" int ds4_gpu_init(void) {
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
-    ds4_gpu_stream_expert_cache_prefetch_finish(true);
+    for (int tier = 0; tier < g_n_gpus; tier++) {
+        (void)cudaSetDevice(g_gpu[tier].device_id);
+        ds4_gpu_stream_expert_cache_prefetch_finish(true);
+        cuda_stream_selected_cache_release();
+        cuda_stream_selected_stage_release();
+    }
     ds4_gpu_tp_shutdown();
     (void)cudaDeviceSynchronize();
     ds4_gpu_decode_graphs_invalidate();
@@ -2962,8 +3016,6 @@ extern "C" void ds4_gpu_cleanup(void) {
             }
         }
     }
-    cuda_stream_selected_cache_release();
-    cuda_stream_selected_stage_release();
     g_n_gpus = 0;
     g_device_is_spark = false;
     g_cublas_ready = 0;
@@ -4097,6 +4149,11 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
  * multi-GPU execution (follow-up). */
 extern "C" int ds4_gpu_set_current_device(int logical_tier) {
     if (logical_tier < 0 || logical_tier >= g_n_gpus) return -1;
+#ifdef DS4_TEST_HOOKS
+    g_cuda_stream_test_device = g_gpu[logical_tier].device_id;
+    g_current_logical_tier = logical_tier;
+    return 0;
+#endif
     if (!g_cuda_no_setdevice_cache && g_current_logical_tier == logical_tier) {
         return 0;
     }
@@ -27476,14 +27533,14 @@ struct cuda_stream_prefetch_copy {
     char *destination;
     uint64_t offset, bytes;
 };
-static struct {
+struct cuda_stream_prefetch_state {
     pthread_t thread;
     bool active = false, ok = false;
     std::atomic<bool> cancel{false};
     ds4_gpu_stream_expert_table table = {};
     std::vector<cuda_stream_prefetch_slot> slots;
     std::vector<cuda_stream_prefetch_copy> copies;
-    int fd = -1, direct_fd = -1, device = 0;
+    int fd = -1, direct_fd = -1, device = 0, owner_tier = -1;
     uint64_t align = 1, file_size = 0, bytes = 0;
     void *stage_raw[2] = {};
     void *stage[2] = {};
@@ -27491,7 +27548,113 @@ static struct {
     cudaStream_t stream = NULL;
     cudaEvent_t ready[2] = {};
     double started = 0, elapsed = 0;
-} g_stream_prefetch;
+};
+static cuda_stream_prefetch_state g_stream_prefetch_states[DS4_MAX_GPUS];
+#define g_stream_prefetch \
+    (g_stream_prefetch_states[cuda_stream_cache_state_index()])
+static cuda_stream_prefetch_state *cuda_stream_prefetch_owner_state(
+        const cuda_stream_prefetch_state &prefetch) {
+    if (prefetch.owner_tier < 0 || prefetch.owner_tier >= DS4_MAX_GPUS)
+        return NULL;
+    return &g_stream_prefetch_states[prefetch.owner_tier];
+}
+static void cuda_stream_prefetch_cleanup_all_tiers(void);
+
+#ifdef DS4_TEST_HOOKS
+extern "C" void ds4_cuda_test_stream_cache_set_device(int device) {
+    g_cuda_stream_test_device = device;
+}
+
+extern "C" void ds4_cuda_test_stream_cache_set_tier_device(
+        int tier, int device) {
+    if (tier < 0 || tier >= DS4_MAX_GPUS) return;
+    g_gpu[tier].device_id = device;
+    if (g_n_gpus <= tier) g_n_gpus = tier + 1;
+}
+
+extern "C" void ds4_cuda_test_stream_cache_seed_current(
+        uint32_t budget, uint64_t expert_bytes, uint64_t clock,
+        uint64_t gate_key, int prefetch_active) {
+    const int tier = cuda_stream_cache_state_index();
+    auto &state = cuda_stream_cache_state_current();
+    state.expert_budget = budget;
+    state.expert_bytes = expert_bytes;
+    state.expert_clock = clock;
+    state.expert_slots.assign(1, {gate_key, gate_key + 1,
+                                  gate_key + 2, clock});
+    state.expert_by_gate.clear();
+    state.expert_by_gate[gate_key] = 0;
+    state.prefill_ids.assign(1, tier);
+    state.prefill_slots.assign(1, 0);
+    state.selected_cache.valid = 1;
+    state.selected_cache.logical_tier = tier;
+    g_stream_selected_stage_bytes = expert_bytes + 7;
+    auto &prefetch = g_stream_prefetch;
+    prefetch.owner_tier = tier;
+    prefetch.active = prefetch_active != 0;
+    prefetch.slots.assign(1, {0, {gate_key, gate_key + 1,
+                                  gate_key + 2, clock}});
+}
+
+extern "C" int ds4_cuda_test_stream_cache_snapshot_current(
+        ds4_cuda_stream_cache_test_snapshot *out) {
+    if (!out) return 0;
+    const auto &state = cuda_stream_cache_state_current();
+    out->budget = state.expert_budget;
+    out->expert_bytes = state.expert_bytes;
+    out->clock = state.expert_clock;
+    out->slot_count = (uint32_t)state.expert_slots.size();
+    out->map_count = (uint32_t)state.expert_by_gate.size();
+    out->prefill_id_count = (uint32_t)state.prefill_ids.size();
+    out->prefill_slot_count = (uint32_t)state.prefill_slots.size();
+    out->selected_valid = state.selected_cache.valid;
+    out->selected_logical_tier = state.selected_cache.logical_tier;
+    out->selected_stage_bytes = g_stream_selected_stage_bytes;
+    out->prefetch_active = g_stream_prefetch.active;
+    out->prefetch_owner_tier = g_stream_prefetch.owner_tier;
+    out->prefetch_slot_count = (uint32_t)g_stream_prefetch.slots.size();
+    return 1;
+}
+
+extern "C" void ds4_cuda_test_stream_cache_release_current(void) {
+    cuda_stream_selected_cache_release();
+}
+
+extern "C" void ds4_cuda_test_stream_cache_teardown_current(void) {
+    auto &state = cuda_stream_cache_state_current();
+    state.selected_cache = {};
+    state.selected_cache.logical_tier = -1;
+    state.expert_budget = 0;
+    state.expert_bytes = 0;
+    state.expert_slots.clear();
+    state.expert_by_gate.clear();
+    state.expert_clock = 1;
+    state.prefill_ids.clear();
+    state.prefill_slots.clear();
+    state.telemetry_decode_token = 0;
+    state.telemetry_prev_layer = UINT32_MAX;
+    g_stream_selected_stage_bytes = 0;
+    auto &prefetch = g_stream_prefetch;
+    prefetch.active = false;
+    prefetch.ok = false;
+    prefetch.cancel.store(false, std::memory_order_relaxed);
+    prefetch.slots.clear();
+    prefetch.copies.clear();
+}
+
+extern "C" int ds4_cuda_test_stream_prefetch_owner_tier(void) {
+    return g_stream_prefetch.owner_tier;
+}
+
+extern "C" int ds4_cuda_test_stream_prefetch_worker_state_tier(
+        int prefetch_state_tier) {
+    if (prefetch_state_tier < 0 || prefetch_state_tier >= DS4_MAX_GPUS)
+        return -1;
+    auto *state = cuda_stream_prefetch_owner_state(
+        g_stream_prefetch_states[prefetch_state_tier]);
+    return state ? (int)(state - g_stream_prefetch_states) : -1;
+}
+#endif
 
 static bool cuda_stream_slot_in_table(const cuda_stream_expert_slot &slot,
                                       const ds4_gpu_stream_expert_table &table) {
@@ -27516,9 +27679,15 @@ static void cuda_stream_prefetch_before_load(const ds4_gpu_stream_expert_table *
         ds4_gpu_stream_expert_cache_prefetch_finish(!same);
 }
 
-static void *cuda_stream_prefetch_read(void *) {
-    auto &p = g_stream_prefetch;
-    p.ok = cudaSetDevice(p.device) == cudaSuccess;
+static void *cuda_stream_prefetch_read(void *opaque) {
+    auto &launch = *(cuda_stream_prefetch_state *)opaque;
+    launch.ok = cudaSetDevice(launch.device) == cudaSuccess;
+    auto *owner = cuda_stream_prefetch_owner_state(launch);
+    if (!launch.ok || !owner) {
+        launch.ok = false;
+        return NULL;
+    }
+    auto &p = *owner;
     uint64_t chunk_index = 0;
     const uint64_t chunk = UINT64_C(8) << 20;
     for (const auto &copy : p.copies) {
@@ -27603,9 +27772,29 @@ extern "C" void ds4_gpu_stream_expert_cache_prefetch_finish(bool cancel) {
     }
 }
 
-static void cuda_stream_prefetch_exit(void) {
-    ds4_gpu_stream_expert_cache_prefetch_finish(true);
+static void cuda_stream_prefetch_cleanup_all_tiers(void) {
+    for (int tier = 0; tier < g_n_gpus; tier++) {
+#ifdef DS4_TEST_HOOKS
+        g_cuda_stream_test_device = g_gpu[tier].device_id;
+#else
+        if (cudaSetDevice(g_gpu[tier].device_id) != cudaSuccess) {
+            (void)cudaGetLastError();
+            continue;
+        }
+#endif
+        ds4_gpu_stream_expert_cache_prefetch_finish(true);
+    }
 }
+
+static void cuda_stream_prefetch_exit(void) {
+    cuda_stream_prefetch_cleanup_all_tiers();
+}
+
+#ifdef DS4_TEST_HOOKS
+extern "C" void ds4_cuda_test_stream_prefetch_cleanup_all(void) {
+    cuda_stream_prefetch_cleanup_all_tiers();
+}
+#endif
 
 extern "C" int ds4_gpu_stream_expert_cache_prefetch(
         const ds4_gpu_stream_expert_table *current,
@@ -27634,6 +27823,7 @@ extern "C" int ds4_gpu_stream_expert_cache_prefetch(
             if (atexit(cuda_stream_prefetch_exit) != 0) return 0;
             exit_registered = true;
         }
+        p.owner_tier = cuda_stream_cache_state_index();
         p.table = *next;
         p.cancel.store(false, std::memory_order_relaxed);
         p.bytes = 0;
@@ -27702,7 +27892,7 @@ extern "C" int ds4_gpu_stream_expert_cache_prefetch(
             return 0;
         }
         p.started = cuda_wall_sec();
-        if (pthread_create(&p.thread, NULL, cuda_stream_prefetch_read, NULL) != 0) throw 0;
+        if (pthread_create(&p.thread, NULL, cuda_stream_prefetch_read, &p) != 0) throw 0;
         p.active = true;
         return 1;
     } catch (...) {
