@@ -42332,6 +42332,10 @@ struct ds4_engine {
     int            placement_session_count_hint;
     uint32_t       glm_session_count;
     uint64_t       glm_session_graph_bytes;
+    /* Stage2B computes these per-tier expert-cache shares during startup.
+     * Stage2C will consume them when it creates tier-local streaming caches. */
+    uint32_t       ssd_streaming_tier_cache_experts[DS4_MAX_GPUS];
+    uint64_t       ssd_streaming_tier_residual_bytes[DS4_MAX_GPUS];
 };
 
 static DS4_MAYBE_UNUSED uint64_t ds4_engine_glm_graph_budget(
@@ -69485,6 +69489,158 @@ static int engine_compute_cuda_ep_placement(
     return 0;
 }
 
+typedef struct {
+    int (*set_tier)(int tier, void *ctx);
+    void (*set_budget)(uint32_t experts, void *ctx);
+    int (*register_shared)(void *ctx);
+    int (*install_resident)(void *ctx);
+    void *ctx;
+} ds4_gpu_init_ops;
+
+static int engine_execute_gpu_init_path(bool multi_tier, bool ssd_streaming,
+                                        int n_tiers,
+                                        const uint32_t *tier_cache_experts,
+                                        const ds4_gpu_init_ops *ops) {
+    if (!ops || !ops->register_shared || !ops->install_resident ||
+        n_tiers <= 0 || n_tiers > DS4_MAX_GPUS ||
+        (!multi_tier && n_tiers != 1)) return -1;
+    if (ssd_streaming) {
+        if (!tier_cache_experts || !ops->set_tier || !ops->set_budget) return -1;
+        int rc = 0;
+        for (int tier = 0; tier < n_tiers; tier++) {
+            if (multi_tier && ops->set_tier(tier, ops->ctx) != 0) {
+                rc = -1;
+                break;
+            }
+            ops->set_budget(tier_cache_experts[tier], ops->ctx);
+        }
+        if (multi_tier && ops->set_tier(0, ops->ctx) != 0) rc = -1;
+        if (rc != 0) return -1;
+        return multi_tier ? ops->register_shared(ops->ctx) : 0;
+    }
+    if (!multi_tier) return 0;
+    if (ops->register_shared(ops->ctx) != 0) return -1;
+    return ops->install_resident(ops->ctx);
+}
+
+static int engine_compute_tier_cache_experts(
+        const uint64_t *entry_bytes, const int *placement, int n_entries,
+        const uint64_t *gpu_budget_bytes, int n_tiers,
+        uint64_t expert_bytes, uint32_t requested, uint32_t *out) {
+    if (!entry_bytes || !placement || !gpu_budget_bytes || !out ||
+        n_entries <= 0 || n_tiers <= 0 || n_tiers > DS4_MAX_GPUS ||
+        expert_bytes == 0 || requested == 0 ||
+        (uint64_t)requested > UINT64_MAX / expert_bytes) return -1;
+    uint64_t used[DS4_MAX_GPUS] = {0};
+    uint64_t slots[DS4_MAX_GPUS] = {0};
+    for (int i = 0; i < n_entries; i++) {
+        const int tier = placement[i];
+        if (tier < 0 || tier >= n_tiers || used[tier] > UINT64_MAX-entry_bytes[i]) return -1;
+        used[tier] += entry_bytes[i];
+    }
+    for (int tier = 0; tier < n_tiers; tier++) {
+        if (used[tier] > gpu_budget_bytes[tier]) return -1;
+        slots[tier] = (gpu_budget_bytes[tier]-used[tier]) / expert_bytes;
+        if (slots[tier] == 0) return -1;
+        out[tier] = 1;
+    }
+    if (requested < (uint32_t)n_tiers) return -1;
+    uint64_t remaining = requested - (uint32_t)n_tiers;
+    for (int tier = 0; tier < n_tiers && remaining; tier++) {
+        uint64_t add = slots[tier]-1;
+        if (add > remaining) add = remaining;
+        if (add > UINT32_MAX-out[tier]) return -1;
+        out[tier] += (uint32_t)add;
+        remaining -= add;
+    }
+    return 0;
+}
+
+/* Stage 2A SSD-streaming placement policy. entry_bytes contains only
+ * persistent per-entry costs (static graph/KV/non-streamed weights); routed
+ * expert residency is deliberately a caller concern and must not be included.
+ * The two-tier tracer chooses one contiguous boundary whose byte share most
+ * closely matches the available budgets. It never emits a CPU tier. */
+static int engine_validate_streamed_placement(const int *placement,
+                                               int n_entries,
+                                               int n_gpus) {
+    if (!placement || n_entries <= 0 || n_gpus <= 0 || n_gpus > 2) return -1;
+    int previous = placement[0];
+    if (previous < 0 || previous >= n_gpus) return -1;
+    for (int entry = 1; entry < n_entries; entry++) {
+        const int tier = placement[entry];
+        if (tier < 0 || tier >= n_gpus || tier < previous) return -1;
+        previous = tier;
+    }
+    return 0;
+}
+
+static int engine_compute_streamed_entry_bytes(ds4_engine *e, size_t *out) {
+    if (engine_compute_entry_bytes(e, out) != 0) return -1;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *layer = &e->weights.layer[il];
+        const ds4_tensor *routed[] = {
+            layer->ffn_gate_exps, layer->ffn_up_exps, layer->ffn_down_exps,
+        };
+        for (uint32_t i = 0; i < 3; i++) {
+            const ds4_tensor *t = routed[i];
+            if (t && out[il + 1u] >= t->bytes) out[il + 1u] -= t->bytes;
+        }
+    }
+    return 0;
+}
+
+static int engine_compute_streamed_placement(
+        const uint64_t *entry_bytes,
+        int n_entries,
+        const uint64_t *gpu_budget_bytes,
+        int n_gpus,
+        int *placement) {
+    if (!entry_bytes || !gpu_budget_bytes || !placement || n_entries <= 0 ||
+        n_gpus <= 0 || n_gpus > 2) {
+        return -1;
+    }
+
+    for (int tier = 0; tier < n_gpus; tier++) {
+        if (gpu_budget_bytes[tier] == 0) return -1;
+    }
+    uint64_t total = 0;
+    for (int entry = 0; entry < n_entries; entry++) {
+        if (total > UINT64_MAX - entry_bytes[entry]) return -1;
+        total += entry_bytes[entry];
+    }
+    if (n_gpus == 1) {
+        if (total > gpu_budget_bytes[0]) return -1;
+        for (int entry = 0; entry < n_entries; entry++) placement[entry] = 0;
+        return engine_validate_streamed_placement(placement, n_entries, n_gpus);
+    }
+    if (n_entries < 2) {
+        return -1;
+    }
+
+    int best_split = -1;
+    __uint128_t best_error = ~(__uint128_t)0;
+    uint64_t left = 0;
+    for (int split = 1; split < n_entries; split++) {
+        if (left > UINT64_MAX - entry_bytes[split - 1]) return -1;
+        left += entry_bytes[split - 1];
+        const uint64_t right = total - left;
+        if (left > gpu_budget_bytes[0] || right > gpu_budget_bytes[1]) continue;
+        const __uint128_t lhs = (__uint128_t)left * gpu_budget_bytes[1];
+        const __uint128_t rhs = (__uint128_t)right * gpu_budget_bytes[0];
+        const __uint128_t error = lhs > rhs ? lhs - rhs : rhs - lhs;
+        if (best_split < 0 || error < best_error) {
+            best_split = split;
+            best_error = error;
+        }
+    }
+    if (best_split < 0) return -1;
+    for (int entry = 0; entry < n_entries; entry++) {
+        placement[entry] = entry < best_split ? 0 : 1;
+    }
+    return engine_validate_streamed_placement(placement, n_entries, n_gpus);
+}
+
 /* Phase A: classify multi-tier on a freshly-opened engine (model loaded,
  * weights bound). Pure CPU — no GPU init required. Sets e->multi_tier,
  * e->n_placement_entries, e->placement[], and e->gpu_cfg. Returns 0 on
@@ -69539,7 +69695,9 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
     }
 
     size_t entry_bytes[DS4_MAX_LAYER + 2];
-    if (engine_compute_entry_bytes(e, entry_bytes) != 0) return -1;
+    if ((e->ssd_streaming ?
+            engine_compute_streamed_entry_bytes(e, entry_bytes) :
+            engine_compute_entry_bytes(e, entry_bytes)) != 0) return -1;
 
     ds4_layer_pack_config pcfg;
     memset(&pcfg, 0, sizeof(pcfg));
@@ -69558,16 +69716,43 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
     if (cuda_tp_ep && engine_reserve_cuda_ep_output_shards(e, &pcfg) != 0) {
         return -1;
     }
-    const int placement_rc = cuda_tp_ep
-        ? engine_compute_cuda_ep_placement(entry_bytes, DS4_N_LAYER + 2,
-                                           &pcfg, e->placement)
-        : ds4_compute_layer_placement(entry_bytes, DS4_N_LAYER + 2, &pcfg,
-                                      e->placement);
+    int placement_rc;
+    if (e->ssd_streaming) {
+        uint64_t streamed_bytes[DS4_MAX_LAYER + 2];
+        uint64_t streamed_budgets[DS4_MAX_GPUS] = {0};
+        for (uint32_t i = 0; i < DS4_N_LAYER + 2u; i++)
+            streamed_bytes[i] = entry_bytes[i];
+        for (int tier = 0; tier < pcfg.n_gpus; tier++)
+            streamed_budgets[tier] = pcfg.gpu_budget_bytes[tier];
+        placement_rc = engine_compute_streamed_placement(
+                streamed_bytes, DS4_N_LAYER + 2, streamed_budgets,
+                pcfg.n_gpus, e->placement);
+    } else {
+        placement_rc = cuda_tp_ep
+            ? engine_compute_cuda_ep_placement(entry_bytes, DS4_N_LAYER + 2,
+                                               &pcfg, e->placement)
+            : ds4_compute_layer_placement(entry_bytes, DS4_N_LAYER + 2, &pcfg,
+                                          e->placement);
+    }
     if (placement_rc != 0) {
         return -1;
     }
     e->n_placement_entries = DS4_N_LAYER + 2;
     engine_adjust_output_head_for_cuda_tp(e, entry_bytes);
+    if (e->ssd_streaming) {
+        uint64_t used[DS4_MAX_GPUS] = {0};
+        for (uint32_t i = 0; i < DS4_N_LAYER + 2u; i++) {
+            const int tier = e->placement[i];
+            if (tier < 0 || tier >= pcfg.n_gpus ||
+                used[tier] > UINT64_MAX - (uint64_t)entry_bytes[i]) return -1;
+            used[tier] += (uint64_t)entry_bytes[i];
+        }
+        for (int tier = 0; tier < pcfg.n_gpus; tier++) {
+            if (used[tier] > pcfg.gpu_budget_bytes[tier]) return -1;
+            e->ssd_streaming_tier_residual_bytes[tier] =
+                pcfg.gpu_budget_bytes[tier] - used[tier];
+        }
+    }
 
     int first_tier = e->placement[0];
     int multi_tier = 0;
@@ -69632,7 +69817,7 @@ static int engine_install_per_device_caches(ds4_engine *e) {
      * can resolve g_model_host_base. We use the no-copy variant so
      * DS4_CUDA_COPY_MODEL cannot reintroduce a full-model copy that would
      * defeat the per-device selective cache. */
-    if (!ds4_gpu_register_model_map_no_copy(e->model.map, e->model.size)) return -1;
+    /* The shared host map is registered once by engine_execute_gpu_init_path. */
 
     /* Per-logical-tier dynamic range lists. */
     ds4_tensor_range *per_dev_ranges[DS4_MAX_GPUS] = {0};
@@ -70067,6 +70252,41 @@ typedef struct {
     uint64_t bytes;
 } ds4_test_fake_tensor;
 
+int ds4_test_compute_streamed_placement(
+        const uint64_t *entry_bytes,
+        int n_entries,
+        const uint64_t *gpu_budget_bytes,
+        int n_gpus,
+        int *placement) {
+    return engine_compute_streamed_placement(entry_bytes, n_entries,
+                                              gpu_budget_bytes, n_gpus,
+                                              placement);
+}
+
+int ds4_test_validate_streamed_placement(const int *placement,
+                                          int n_entries,
+                                          int n_gpus) {
+    return engine_validate_streamed_placement(placement, n_entries, n_gpus);
+}
+
+
+int ds4_test_execute_gpu_init_path(int multi_tier, int ssd_streaming,
+                                   int n_tiers,
+                                   const uint32_t *tier_cache_experts,
+                                   const ds4_gpu_init_ops *ops) {
+    return engine_execute_gpu_init_path(multi_tier != 0, ssd_streaming != 0,
+                                        n_tiers, tier_cache_experts, ops);
+}
+
+int ds4_test_compute_tier_cache_experts(
+        const uint64_t *entry_bytes, const int *placement, int n_entries,
+        const uint64_t *gpu_budget_bytes, int n_tiers, uint64_t expert_bytes,
+        uint32_t requested, uint32_t *out) {
+    return engine_compute_tier_cache_experts(entry_bytes, placement, n_entries,
+                                              gpu_budget_bytes, n_tiers,
+                                              expert_bytes, requested, out);
+}
+
 int ds4_test_tensor_to_entry(const char *name, int name_len) {
     ds4_tensor fake;
     memset(&fake, 0, sizeof(fake));
@@ -70356,6 +70576,52 @@ static int engine_install_gpu_placement(ds4_engine *e);
 static int ds4_engine_open_internal(ds4_engine **out,
                                     const ds4_engine_options *opt,
                                     const ds4_gpu_config *gpu_cfg);
+
+#ifndef DS4_NO_GPU
+static int engine_gpu_init_set_tier(int tier, void *ctx) {
+    (void)ctx;
+    return ds4_gpu_set_current_device(tier);
+}
+static void engine_gpu_init_set_budget(uint32_t experts, void *ctx) {
+    (void)ctx;
+    ds4_gpu_set_streaming_expert_cache_budget(experts);
+}
+static int engine_gpu_init_register_shared(void *ctx) {
+    ds4_engine *e = ctx;
+    return ds4_gpu_register_model_map_no_copy(e->model.map, e->model.size) ? 0 : -1;
+}
+static int engine_gpu_init_install_resident(void *ctx) {
+    return engine_install_gpu_placement(ctx);
+}
+static ds4_gpu_init_ops engine_gpu_init_ops(ds4_engine *e) {
+    ds4_gpu_init_ops ops = {engine_gpu_init_set_tier,
+                            engine_gpu_init_set_budget,
+                            engine_gpu_init_register_shared,
+                            engine_gpu_init_install_resident, e};
+    return ops;
+}
+
+static bool engine_configure_streaming_after_gpu_init(
+        ds4_engine *e,
+        const ds4_engine_options *opt,
+        bool load_slice,
+        uint32_t load_layer_start,
+        uint32_t load_layer_end,
+        bool load_output) {
+    ds4_gpu_set_ssd_streaming(e->ssd_streaming);
+    if (!ds4_engine_configure_streaming_auto_cache(e, opt->context_size) ||
+        !ds4_engine_configure_streaming_cache_budget(e)) return false;
+    ds4_engine_fit_glm_streaming_budget(e, load_slice, load_layer_start,
+                                        load_layer_end, load_output,
+                                        opt->context_size);
+    if (!ds4_engine_glm_streaming_memory_guard(
+                e, load_slice, load_layer_start, load_layer_end, load_output,
+                opt->context_size, "after GLM streaming cache budget")) {
+        return false;
+    }
+    return true;
+}
+#endif
 
 static bool engine_warm_full_model(const ds4_engine_options *opt) {
     /* Partial/streaming setups use their own bounded preparation. Do not
@@ -71012,13 +71278,6 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
-    if (e->ssd_streaming && e->multi_tier) {
-        fprintf(stderr,
-                "ds4: --ssd-streaming is not compatible with multi-GPU placement\n");
-        ds4_engine_close(e);
-        *out = NULL;
-        return 1;
-    }
     if (gpu_cfg && e->n_placement_entries > 0) {
         int spilled = 0;
         size_t spilled_bytes = 0;
@@ -71199,18 +71458,57 @@ static int ds4_engine_open_internal(ds4_engine **out,
             }
             e->metal_ready = true;
             ds4_gpu_set_quality(e->quality);
-#ifdef DS4_ROCM_BUILD
-            /*
-             * The ROCm Q8 decode selector must know that a multi-tier model
-             * is GLM before any layer dispatch.  The single-tier path sets
-             * the same model-family state below.
-             */
+            /* Match the single-tier quality/model-family setup before any
+             * streaming or resident cache initialization. */
             ds4_gpu_set_glm_model(
                     DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
-#endif
+            if (e->ssd_streaming) {
+                const bool include_output = load_output ||
+                    (load_output_optional && weights_have_output_head(&e->weights));
+                if (!engine_configure_streaming_after_gpu_init(
+                            e, opt, load_slice, load_layer_start,
+                            load_layer_end, include_output)) {
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+                uint64_t expert_bytes = 0;
+                uint64_t static_bytes[] = {0};
+                int static_placement[] = {0};
+                uint64_t residual_budgets[DS4_MAX_GPUS] = {0};
+                for (int tier = 0; tier < e->gpu_cfg.n_gpus; tier++)
+                    residual_budgets[tier] = e->ssd_streaming_tier_residual_bytes[tier];
+                if (!ds4_streaming_routed_expert_bytes(&e->weights, &expert_bytes) ||
+                    engine_compute_tier_cache_experts(
+                        static_bytes, static_placement, 1, residual_budgets,
+                        e->gpu_cfg.n_gpus, expert_bytes,
+                        e->ssd_streaming_cache_experts,
+                        e->ssd_streaming_tier_cache_experts) != 0) {
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+                ds4_gpu_init_ops init_ops = engine_gpu_init_ops(e);
+                if (engine_execute_gpu_init_path(
+                        true, true, e->gpu_cfg.n_gpus,
+                        e->ssd_streaming_tier_cache_experts, &init_ops) != 0) {
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+                (void)ds4_gpu_set_model_fd(e->model.fd);
+                fprintf(stderr,
+                        "ds4: dual-GPU SSD streaming initialization complete; "
+                        "runtime routing requires Stage2C and remains disabled\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
             (void)ds4_gpu_set_model_fd(e->model.fd);
 
-            if (engine_install_gpu_placement(e) != 0) {
+            ds4_gpu_init_ops init_ops = engine_gpu_init_ops(e);
+            if (engine_execute_gpu_init_path(true, false, e->gpu_cfg.n_gpus,
+                                             NULL, &init_ops) != 0) {
                 ds4_engine_close(e);
                 *out = NULL;
                 return 1;
@@ -71243,17 +71541,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         ds4_gpu_set_quality(e->quality);
         ds4_gpu_set_glm_model(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
-        ds4_gpu_set_ssd_streaming(e->ssd_streaming);
-        if (!ds4_engine_configure_streaming_auto_cache(e, opt->context_size)) {
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-        if (!ds4_engine_configure_streaming_cache_budget(e)) {
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
+        const bool include_output = load_output ||
+            (load_output_optional && weights_have_output_head(&e->weights));
 #ifdef DS4_HAS_DEEPSEEK41_GPU
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
             const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096;
@@ -71266,29 +71555,23 @@ static int ds4_engine_open_internal(ds4_engine **out,
             }
         }
 #endif
-        ds4_engine_fit_glm_streaming_budget(
-                e,
-                load_slice,
-                load_layer_start,
-                load_layer_end,
-                load_output ||
-                    (load_output_optional && weights_have_output_head(&e->weights)),
-                opt->context_size);
-        if (!ds4_engine_glm_streaming_memory_guard(
-                    e,
-                    load_slice,
-                    load_layer_start,
-                    load_layer_end,
-                    load_output ||
-                        (load_output_optional &&
-                         weights_have_output_head(&e->weights)),
-                    opt->context_size,
-                    "after GLM streaming cache budget")) {
+        if (!engine_configure_streaming_after_gpu_init(
+                    e, opt, load_slice, load_layer_start, load_layer_end,
+                    include_output)) {
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
-        ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
+        if (e->ssd_streaming) {
+            const uint32_t tier_budget[] = {e->ssd_streaming_cache_experts};
+            ds4_gpu_init_ops init_ops = engine_gpu_init_ops(e);
+            if (engine_execute_gpu_init_path(false, true, 1, tier_budget,
+                                             &init_ops) != 0) {
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+        }
 #if defined(__APPLE__)
         /* Keep the weights used by every token from competing with streamed
          * experts in the file cache. These bytes are already in the model

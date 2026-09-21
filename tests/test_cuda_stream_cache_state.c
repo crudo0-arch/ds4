@@ -2,6 +2,9 @@
 #include <assert.h>
 #include <stdio.h>
 
+extern void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
+extern uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
+
 static ds4_cuda_stream_cache_test_snapshot snapshot_current(void) {
     ds4_cuda_stream_cache_test_snapshot s;
     assert(ds4_cuda_test_stream_cache_snapshot_current(&s));
@@ -13,6 +16,15 @@ int main(void) {
      * returns the CUDA device ordinal directly or always selects tier zero. */
     ds4_cuda_test_stream_cache_set_tier_device(0, 7);
     ds4_cuda_test_stream_cache_set_tier_device(1, 3);
+
+    /* Production budget setter/getter must route through current device state. */
+    ds4_cuda_test_stream_cache_set_device(7);
+    ds4_gpu_set_streaming_expert_cache_budget(5);
+    ds4_cuda_test_stream_cache_set_device(3);
+    ds4_gpu_set_streaming_expert_cache_budget(3);
+    assert(ds4_gpu_stream_expert_cache_configured_count() == 3);
+    ds4_cuda_test_stream_cache_set_device(7);
+    assert(ds4_gpu_stream_expert_cache_configured_count() == 5);
 
     ds4_cuda_test_stream_cache_set_device(7);
     ds4_cuda_test_stream_cache_teardown_current();

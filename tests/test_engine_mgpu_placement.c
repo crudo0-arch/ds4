@@ -88,6 +88,25 @@ uint64_t ds4_test_glm_memory_guard_default_budget(uint64_t host_bytes,
 int ds4_test_glm_memory_guard_disabled(void);
 int ds4_test_qwen4_placement(uint64_t budget, int sessions,
                               size_t *weights, size_t *runtime);
+int ds4_test_compute_streamed_placement(const uint64_t *entry_bytes,
+                                         int n_entries,
+                                         const uint64_t *gpu_budget_bytes,
+                                         int n_gpus,
+                                         int *placement);
+int ds4_test_validate_streamed_placement(const int *placement,
+                                          int n_entries,
+                                          int n_gpus);
+
+
+typedef struct {
+    int (*set_tier)(int tier, void *ctx);
+    void (*set_budget)(uint32_t experts, void *ctx);
+    int (*register_shared)(void *ctx);
+    int (*install_resident)(void *ctx);
+    void *ctx;
+} ds4_test_gpu_init_ops;
+int ds4_test_execute_gpu_init_path(int multi_tier, int ssd_streaming, int n_tiers, const uint32_t *tier_cache_experts, const ds4_test_gpu_init_ops *ops);
+int ds4_test_compute_tier_cache_experts(const uint64_t *entry_bytes, const int *placement, int n_entries, const uint64_t *gpu_budget_bytes, int n_tiers, uint64_t expert_bytes, uint32_t requested, uint32_t *out);
 
 /* DS4_N_LAYER constant is private to ds4.c; for the test we use
  * the same value. (The packer header doesn't expose it.) */
@@ -721,6 +740,148 @@ static void test_qwen4_disk_ngram_accounting(void) {
           "Qwen still refuses a budget smaller than its resident weights");
 }
 
+
+static void test_streamed_balanced_two_tier_contiguous_split(void) {
+    fprintf(stderr, "RUN: test_streamed_balanced_two_tier_contiguous_split\n");
+    const uint64_t bytes[] = {1, 1, 1, 1, 1, 1};
+    const uint64_t budgets[] = {3, 3};
+    const int expected[] = {0, 0, 0, 1, 1, 1};
+    int placement[6] = {-9, -9, -9, -9, -9, -9};
+    CHECK(ds4_test_compute_streamed_placement(bytes, 6, budgets, 2,
+                                               placement) == 0,
+          "balanced streamed placement succeeds");
+    CHECK(memcmp(placement, expected, sizeof(expected)) == 0,
+          "balanced streamed placement is one contiguous 3/3 split");
+}
+
+static void test_streamed_asymmetric_shifted_contiguous_split(void) {
+    fprintf(stderr, "RUN: test_streamed_asymmetric_shifted_contiguous_split\n");
+    const uint64_t bytes[] = {1, 1, 1, 1, 1, 1};
+    const uint64_t budgets[] = {2, 4};
+    const int expected[] = {0, 0, 1, 1, 1, 1};
+    int placement[6] = {-9, -9, -9, -9, -9, -9};
+    CHECK(ds4_test_compute_streamed_placement(bytes, 6, budgets, 2,
+                                               placement) == 0,
+          "asymmetric streamed placement succeeds");
+    CHECK(memcmp(placement, expected, sizeof(expected)) == 0,
+          "larger tier receives a shifted contiguous run");
+}
+
+static void test_streamed_invalid_tier_refusal(void) {
+    fprintf(stderr, "RUN: test_streamed_invalid_tier_refusal\n");
+    const int placement[] = {0, 0, 2, 1};
+    CHECK(ds4_test_validate_streamed_placement(placement, 4, 2) != 0,
+          "tier outside [0,n_gpus) is refused");
+}
+
+static void test_streamed_cpu_spill_refusal(void) {
+    fprintf(stderr, "RUN: test_streamed_cpu_spill_refusal\n");
+    const int spill[] = {0, 0, DS4_LAYER_PACK_CPU, 1};
+    const uint64_t bytes[] = {1, 1, 1, 1, 1, 1};
+    const uint64_t budgets[] = {2, 2};
+    int placement[6] = {0};
+    CHECK(ds4_test_validate_streamed_placement(spill, 4, 2) != 0,
+          "CPU tier is invalid for streamed placement");
+    CHECK(ds4_test_compute_streamed_placement(bytes, 6, budgets, 2,
+                                               placement) != 0,
+          "planner refuses instead of spilling persistent state to CPU");
+}
+
+static void test_streamed_embedding_layer_output_validation(void) {
+    fprintf(stderr, "RUN: test_streamed_embedding_layer_output_validation\n");
+    int placement[] = {0, 0, 1, 1};
+    CHECK(ds4_test_validate_streamed_placement(placement, 4, 2) == 0,
+          "embedding, every layer, and output have one valid GPU");
+    placement[0] = 2;
+    CHECK(ds4_test_validate_streamed_placement(placement, 4, 2) != 0,
+          "invalid embedding placement is refused");
+    placement[0] = 0; placement[1] = 2;
+    CHECK(ds4_test_validate_streamed_placement(placement, 4, 2) != 0,
+          "invalid layer placement is refused");
+    placement[1] = 0; placement[3] = 2;
+    CHECK(ds4_test_validate_streamed_placement(placement, 4, 2) != 0,
+          "invalid output placement is refused");
+}
+
+static void test_streamed_one_gpu_all_tier_zero(void) {
+    fprintf(stderr, "RUN: test_streamed_one_gpu_all_tier_zero\n");
+    const uint64_t bytes[] = {3, 5, 7, 11};
+    const uint64_t budgets[] = {26};
+    const int expected[] = {0, 0, 0, 0};
+    int placement[4] = {-9, -9, -9, -9};
+    CHECK(ds4_test_compute_streamed_placement(bytes, 4, budgets, 1,
+                                               placement) == 0,
+          "one-GPU streamed placement succeeds");
+    CHECK(memcmp(placement, expected, sizeof(expected)) == 0,
+          "one-GPU streamed placement assigns every entry to tier 0");
+}
+
+static void test_streamed_one_gpu_rejects_zero_capacity(void) {
+    fprintf(stderr, "RUN: test_streamed_one_gpu_rejects_zero_capacity\n");
+    const uint64_t bytes[] = {0, 0, 0, 0};
+    const uint64_t budgets[] = {0};
+    int placement[4] = {-9, -9, -9, -9};
+    CHECK(ds4_test_compute_streamed_placement(bytes, 4, budgets, 1,
+                                               placement) != 0,
+          "one-GPU streamed placement rejects zero capacity");
+}
+
+static void test_streamed_rejects_alternating_tiers(void) {
+    fprintf(stderr, "RUN: test_streamed_rejects_alternating_tiers\n");
+    const int alternating[] = {0, 1, 0, 1};
+    CHECK(ds4_test_validate_streamed_placement(alternating, 4, 2) != 0,
+          "alternating 0,1,0,1 placement is not contiguous");
+}
+
+
+typedef struct { int tiers[8]; uint32_t budgets[8]; int n_tiers, n_budgets, registers, resident_installs, fail_tier; } init_trace;
+static int trace_set_tier(int tier, void *opaque) { init_trace *t=opaque; t->tiers[t->n_tiers++]=tier; return tier==t->fail_tier ? -1 : 0; }
+static void trace_set_budget(uint32_t budget, void *opaque) { init_trace *t=opaque; t->budgets[t->n_budgets++]=budget; }
+static int trace_register(void *opaque) { init_trace *t=opaque; t->registers++; return 0; }
+static int trace_resident(void *opaque) { init_trace *t=opaque; t->resident_installs++; return 0; }
+static ds4_test_gpu_init_ops trace_ops(init_trace *t) { ds4_test_gpu_init_ops ops={trace_set_tier,trace_set_budget,trace_register,trace_resident,t}; return ops; }
+
+static void test_real_streamed_init_installs_each_tier_and_restores_zero(void) {
+    fprintf(stderr, "RUN: test_real_streamed_init_installs_each_tier_and_restores_zero\n");
+    const uint32_t budgets[]={5,3}; init_trace t={.fail_tier=-1}; ds4_test_gpu_init_ops ops=trace_ops(&t);
+    CHECK(ds4_test_execute_gpu_init_path(1,1,2,budgets,&ops)==0,"real streamed executor succeeds");
+    const int expected_tiers[]={0,1,0}; const uint32_t expected_budgets[]={5,3};
+    CHECK(t.n_tiers==3 && memcmp(t.tiers,expected_tiers,sizeof(expected_tiers))==0,"streamed executor visits tier0/tier1 and restores tier0");
+    CHECK(t.n_budgets==2 && memcmp(t.budgets,expected_budgets,sizeof(expected_budgets))==0,"streamed executor installs distinct real tier budgets");
+    CHECK(t.registers==1,"streamed executor registers shared model once"); CHECK(t.resident_installs==0,"streamed executor skips resident install");
+}
+static void test_real_streamed_init_propagates_tier_switch_failure(void) {
+    fprintf(stderr, "RUN: test_real_streamed_init_propagates_tier_switch_failure\n");
+    const uint32_t budgets[]={5,3}; init_trace t={.fail_tier=1}; ds4_test_gpu_init_ops ops=trace_ops(&t);
+    CHECK(ds4_test_execute_gpu_init_path(1,1,2,budgets,&ops)!=0,"tier switch failure propagates");
+    CHECK(t.tiers[t.n_tiers-1]==0,"failed streamed executor restores tier0");
+    CHECK(t.registers==0 && t.resident_installs==0,"failure stops before registration or resident install");
+}
+static void test_real_resident_and_single_paths(void) {
+    fprintf(stderr, "RUN: test_real_resident_and_single_paths\n");
+    init_trace resident={.fail_tier=-1}; ds4_test_gpu_init_ops rops=trace_ops(&resident);
+    CHECK(ds4_test_execute_gpu_init_path(1,0,2,NULL,&rops)==0,"resident multi-tier real branch succeeds");
+    CHECK(resident.registers==1 && resident.resident_installs==1 && resident.n_budgets==0,"resident branch registers once and installs resident placement");
+    const uint32_t b[]={7}; init_trace single={.fail_tier=-1}; ds4_test_gpu_init_ops sops=trace_ops(&single);
+    CHECK(ds4_test_execute_gpu_init_path(0,1,1,b,&sops)==0,"single streamed real branch succeeds");
+    CHECK(single.n_budgets==1 && single.budgets[0]==7 && single.registers==0 && single.resident_installs==0,"single streamed branch installs its cache and leaves legacy map registration in place");
+}
+static void test_cache_derived_from_post_placement_residual(void) {
+    fprintf(stderr, "RUN: test_cache_derived_from_post_placement_residual\n");
+    const uint64_t bytes[]={20,30,20,10}, budgets[]={100,70}; const int placement[]={0,0,1,1}; uint32_t out[2]={99,99};
+    CHECK(ds4_test_compute_tier_cache_experts(bytes,placement,4,budgets,2,10,8,out)==0,"cache derives from residual");
+    CHECK(out[0]==5 && out[1]==3,"post-placement residual produces distinct reduced tier slots");
+}
+static void test_cache_refuses_overflow_and_no_slot(void) {
+    fprintf(stderr, "RUN: test_cache_refuses_overflow_and_no_slot\n");
+    const uint64_t ob[]={UINT64_MAX,1}, hb[]={UINT64_MAX}; const int op[]={0,0}; uint32_t out[2]={0};
+    CHECK(ds4_test_compute_tier_cache_experts(ob,op,2,hb,1,1,1,out)!=0,"placed-byte overflow is refused");
+    const uint64_t bytes[]={100,50}, budgets[]={100,100}; const int placement[]={0,1};
+    CHECK(ds4_test_compute_tier_cache_experts(bytes,placement,2,budgets,2,10,2,out)!=0,"tier with no expert slot is refused");
+    CHECK(ds4_test_compute_tier_cache_experts(bytes,placement,2,budgets,2,UINT64_MAX,2,out)!=0,"cache-byte multiplication overflow is refused");
+}
+
+
 int main(void) {
     test_tensor_to_entry();
     test_null_config();
@@ -736,6 +897,19 @@ int main(void) {
     test_cuda_tp_prefill_default_accounting();
     test_cuda_tp_output_head_moves_to_lower_half();
     test_qwen4_disk_ngram_accounting();
+    test_streamed_balanced_two_tier_contiguous_split();
+    test_streamed_asymmetric_shifted_contiguous_split();
+    test_streamed_invalid_tier_refusal();
+    test_streamed_cpu_spill_refusal();
+    test_streamed_embedding_layer_output_validation();
+    test_streamed_one_gpu_all_tier_zero();
+    test_streamed_one_gpu_rejects_zero_capacity();
+    test_streamed_rejects_alternating_tiers();
+    test_real_streamed_init_installs_each_tier_and_restores_zero();
+    test_real_streamed_init_propagates_tier_switch_failure();
+    test_real_resident_and_single_paths();
+    test_cache_derived_from_post_placement_residual();
+    test_cache_refuses_overflow_and_no_slot();
 
     fprintf(stderr, "\ntest_engine_mgpu_placement: %d/%d checks passed (%d failed)\n",
             g_checks - g_failures, g_checks, g_failures);
